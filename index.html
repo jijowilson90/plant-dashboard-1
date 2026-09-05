@@ -3847,6 +3847,7 @@ const ONEDRIVE_FILES = [
   { key: 'utilityGasAlloc', fileName: 'Utility_GasWaterAllocation.xlsx', parseFn: parseGasWaterAllocFile, mapRow: null },
   { key: 'utilityElecAlloc', fileName: 'Utility_ElectricityAllocation.xlsx', parseFn: parseElectricityAllocFile, mapRow: null },
 ];
+const ROLES_FILE_NAME = 'Roles.xlsx';
 
 async function acquireGraphToken(instance, account) {
   const request = { scopes: GRAPH_SCOPES, account };
@@ -3926,6 +3927,29 @@ async function loadAllFromOneDrive(instance, account, onProgress) {
   const data = {};
   const report = [];
 
+  // Roles.xlsx is read first, in the same pass as everything else, so who's allowed in and
+  // what they see is just as live and easy for Jijo to edit as any other data file — a plain
+  // two-column sheet (Email, Role), no code change needed to add or change anyone.
+  let rolesMap = {};
+  onProgress?.(`Reading ${ROLES_FILE_NAME}…`);
+  const rolesChild = findChild(ROLES_FILE_NAME);
+  if (!rolesChild) {
+    report.push({ fileName: ROLES_FILE_NAME, status: 'error', message: `Not found in the shared folder. ${folderContentsNote}` });
+  } else {
+    try {
+      const blob = await fetchSharedFileContent(accessToken, driveId, rolesChild.id, ROLES_FILE_NAME);
+      const rawRows = await parseSpreadsheetFile(blob);
+      rawRows.forEach(r => {
+        const email = pick(r, ['email', 'Email']);
+        const role = pick(r, ['role', 'Role']);
+        if (email && role) rolesMap[String(email).toLowerCase()] = String(role).trim();
+      });
+      report.push({ fileName: ROLES_FILE_NAME, status: 'ok', count: Object.keys(rolesMap).length });
+    } catch (err) {
+      report.push({ fileName: ROLES_FILE_NAME, status: 'error', message: err.message || String(err) });
+    }
+  }
+
   for (const { key, fileName, parseFn, mapRow } of ONEDRIVE_FILES) {
     onProgress?.(`Reading ${fileName}…`);
     const child = findChild(fileName);
@@ -3949,8 +3973,9 @@ async function loadAllFromOneDrive(instance, account, onProgress) {
     }
   }
 
-  return { data, report };
+  return { data, report, rolesMap };
 }
+
 
 // ---------- Sign-in gate ----------
 // Shows the Microsoft sign-in screen until someone's authenticated; once signed in, renders
@@ -3965,17 +3990,17 @@ const msalConfig = {
   cache: { cacheLocation: 'sessionStorage' },
 };
 
-// Role list — who's allowed in, and what they see. This is Step 1 of the plan discussed:
-// an editable list Jijo maintains directly (for now, here in the file; later this could move
-// to somewhere he can edit without needing a code change, like a small admin screen).
-// IMPORTANT: replace the placeholder email below with real Saudi Ceramics email addresses.
-const ROLES = {
-  'jijo.wilson@saudiceramics.com': 'Admin',
-  // 'manager.email@saudiceramics.com': 'Management',
-  // 'technician.email@saudiceramics.com': 'Technician',
-};
-function roleFor(email) {
-  return ROLES[(email || '').toLowerCase()] || null; // null = signed in, but no role assigned yet
+// Role list — who's allowed in, and what they see. Now read live from "Roles.xlsx" in the
+// same OneDrive folder as everything else (columns: Email, Role) — Jijo edits that file
+// directly to add or change anyone, no code change needed.
+// This one email is a permanent safety net: Jijo always has Admin access even if Roles.xlsx
+// fails to load, is temporarily unreachable, or he simply forgets to include his own row —
+// nobody should be able to lock themselves out of their own dashboard by accident.
+const PERMANENT_ADMIN_EMAIL = 'jijo.wilson@saudiceramics.com';
+function roleFor(email, rolesMap) {
+  const normalized = (email || '').toLowerCase();
+  if (normalized === PERMANENT_ADMIN_EMAIL) return 'Admin';
+  return rolesMap?.[normalized] || null; // null = signed in, but no role assigned yet
 }
 
 // The MSAL instance is created once here (not inside SignInScreen) so that both the sign-in
@@ -4113,6 +4138,7 @@ function AuthGate() {
   const [account, setAccount] = useState(null);
   const [loadState, setLoadState] = useState({ phase: 'idle' }); // idle | loading | error | ready
   const [oneDriveData, setOneDriveData] = useState(null);
+  const [rolesMap, setRolesMap] = useState({});
 
   const handleSignOut = () => {
     const { instance } = getMsal();
@@ -4127,8 +4153,9 @@ function AuthGate() {
     setLoadState({ phase: 'loading', message: 'Connecting to OneDrive…' });
     try {
       const { instance } = getMsal();
-      const { data, report } = await loadAllFromOneDrive(instance, acc, (msg) => setLoadState({ phase: 'loading', message: msg }));
+      const { data, report, rolesMap: loadedRoles } = await loadAllFromOneDrive(instance, acc, (msg) => setLoadState({ phase: 'loading', message: msg }));
       setOneDriveData(data);
+      setRolesMap(loadedRoles || {});
       const anyFailed = report.some(r => r.status === 'error');
       if (anyFailed) {
         setLoadState({ phase: 'error', report });
@@ -4151,12 +4178,8 @@ function AuthGate() {
   if (!account) {
     return <SignInScreen onSignedIn={handleSignedIn} />;
   }
-  const role = roleFor(account.username);
-  if (!role) {
-    return <NoRoleScreen account={account} onSignOut={handleSignOut} />;
-  }
-  if (loadState.phase === 'loading') {
-    return <LoadingScreen message={loadState.message} />;
+  if (loadState.phase === 'loading' || loadState.phase === 'idle') {
+    return <LoadingScreen message={loadState.message || 'Loading…'} />;
   }
   if (loadState.phase === 'error') {
     return (
@@ -4166,6 +4189,15 @@ function AuthGate() {
         onContinueAnyway={() => setLoadState({ phase: 'ready' })}
       />
     );
+  }
+  // Role is checked only once loading has actually finished (or "Continue anyway" was
+  // clicked) — Roles.xlsx is read in the same OneDrive pass as everything else, so this is
+  // the earliest point a real answer is available. Jijo's own email always resolves to Admin
+  // regardless of what's in that file (or whether it even loaded), so he can never be
+  // accidentally locked out of his own dashboard.
+  const role = roleFor(account.username, rolesMap);
+  if (!role) {
+    return <NoRoleScreen account={account} onSignOut={handleSignOut} />;
   }
   return <AssetDashboard role={role} userName={account.name} onSignOut={handleSignOut} initialData={oneDriveData || {}} />;
 }
